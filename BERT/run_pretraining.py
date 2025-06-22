@@ -53,13 +53,7 @@ if __name__ == '__main__':
     with open(config.output_filename, 'r') as f:
         instances = json.load(f)
 
-    split_idx = int(len(instances['input_ids']) * 0.8)
-    train_instances = {k: v[:split_idx] for k, v in instances.items()}
-    valid_instances = {k: v[split_idx:] for k, v in instances.items()}
-
-    train_loader = get_loader(train_instances, config, shuffle=True)
-    valid_loader = get_loader(valid_instances, config, shuffle=False)
-
+    train_loader = get_loader(instances, config, shuffle=True)
     print('Data Preparation Complete')
 
     print('Training Phase...')
@@ -71,15 +65,9 @@ if __name__ == '__main__':
     total_steps = len(train_loader) * config.epochs
     optimizer, scheduler = optimizer_and_scheduler(model, total_steps, config)
 
-    best_loss = float('inf')
     for epoch in range(config.epochs):
         train_loss, train_mlm_loss, train_nsp_loss = train(model, train_loader, criterion, optimizer, scheduler, config)
-        valid_loss, valid_mlm_loss, valid_nsp_loss = evaluate(model, valid_loader, criterion, config)
-
         print(f'Train Loss: {train_loss:.4f} | MLM Loss: {train_mlm_loss:.4f} | NSP Loss: {train_nsp_loss:.4f}')
-        print(f'Valid Loss: {valid_loss:.4f} | MLM Loss: {valid_mlm_loss:.4f} | NSP Loss: {valid_nsp_loss:.4f}')
 
-        if valid_loss < best_loss:
-            best_loss = valid_loss
-            torch.save(model.state_dict(), 'best_model-{0}.pt'.format(valid_loss))
+    torch.save(model.state_dict(), 'pretraining_model.pt')
     print('Training Complete...')

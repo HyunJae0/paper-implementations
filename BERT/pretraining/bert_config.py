@@ -21,15 +21,15 @@ class PreTrainingBertConfig:
             batch_size=32,
             num_workers=4,
             pin_memory=True,
-            initializer_range = 0.02,
-            lr = 1e-4,
+            initializer_range=0.02,
+            lr=1e-4,
             betas=(0.9, 0.999),
             weight_decay=0.01,
-            adamw_eps = 1e-6,
-            warmup_steps = 100,
-            clip = 0.1,
+            adamw_eps=1e-6,
+            warmup_steps=100,
+            clip=0.1,
             epochs=2,
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             ):
 
         # model params

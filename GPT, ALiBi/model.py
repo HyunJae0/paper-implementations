@@ -7,12 +7,45 @@ class Config:
     def __init__(self):
         self.vocab_size = 50257
         self.d_model = 768
-        self.attn_heads = 12
+        self.attn_heads = 8
         self.num_layers = 12
         self.dropout_ratio = 0.1
         self.attn_probs_dropout = 0.1
         self.ctx_len = 1024
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+## ALiBi
+def precompute_alibi_bias(args: Config):
+    num_heads = args.attn_heads
+    ctx_len = args.ctx_len
+
+    # ALiBi slopes: m = 2^(-8i/n) where i is head index, n is num_heads
+    # for num_heads=8: slopes = [1/2^1, 1/2^2, ..., 1/2^8]
+    def get_slopes(n):
+        def get_slopes_power_of_2(n):
+            start = 2 ** (-8 / n)
+            return [start ** i for i in range(1, n + 1)] 
+        
+        # if n is power of 2 
+        if math.log2(n).is_integer():
+            return get_slopes_power_of_2(n)
+        else:
+            # otherwise, interpolate
+            closest_power_of_2 = 2 ** math.floor(math.log2(n))
+            return get_slopes_power_of_2(closest_power_of_2) + \
+                       get_slopes(2 * closest_power_of_2)[0::2][:n - closest_power_of_2]
+          
+    slopes = torch.tensor(get_slopes(num_heads))
+
+    # create position differences matrix: [seq_len, seq_len]
+    # for causal attention: bias[i,j] = -|i-j| * slope when j <= i, else -inf
+    context_position = torch.arange(ctx_len)[:, None]
+    memory_position = torch.arange(ctx_len)[None, :]
+    relative_position = memory_position - context_position  # [ctx_len, ctx_len]
+
+    # ALiBi adds negative bias based on distance
+    alibi_bias = slopes.view(num_heads, 1, 1) * relative_position.unsqueeze(0)
+    return alibi_bias # shape: [num_heads, ctx_len, ctx_len]
 
 class MHA(nn.Module):
     def __init__(self, config):
@@ -29,42 +62,7 @@ class MHA(nn.Module):
         self.W_v = nn.Linear(self.d_model, self.d_model, bias=False)
         self.W_o = nn.Linear(self.d_model, self.d_model, bias=False)
 
-        self._init_alibi_slopes() # pre-calculate slopes at model initialization time
-
-    ## ALiBi
-    def _init_alibi_slopes(self):
-        # ALiBi slopes: m = 2^(-8i/n) where i is head index, n is num_heads
-        # for num_heads=8: slopes = [1/2^1, 1/2^2, ..., 1/2^8]
-        def get_slopes(n):
-            def get_slopes_power_of_2(n):
-                start = 2 ** (-8 / n)
-                return [start ** i for i in range(1, n + 1)] 
-
-            # if n is power of 2 
-            if math.log2(n).is_integer():
-                return get_slopes_power_of_2(n) 
-            else:
-                # otherwise, interpolate
-                closest_power_of_2 = 2 ** math.floor(math.log2(n))
-                return get_slopes_power_of_2(closest_power_of_2) + \
-                       get_slopes(2 * closest_power_of_2)[0::2][:n - closest_power_of_2]
-
-        slopes = torch.tensor(get_slopes(self.num_heads))
-        # shape: [num_heads, 1, 1] for broadcasting
-        self.register_buffer("alibi_slopes", slopes.view(self.num_heads, 1, 1), persistent=False) # register_buffer의 역할 -> 학습 파라미터는 아니지만 모델의 일부로 등록, 
-
-    def _get_alibi_bias(self, seq_len):
-        # create position differences matrix: [seq_len, seq_len]
-        # for causal attention: bias[i,j] = -|i-j| * slope when j <= i, else -inf
-        context_position = torch.arange(seq_len, device=self.alibi_slopes.device)[:, None]
-        memory_position = torch.arange(seq_len, device=self.alibi_slopes.device)[None, :]
-        relative_position = memory_position - context_position  # [seq_len, seq_len]
-
-        # ALiBi adds negative bias based on distance 
-        alibi_bias = self.alibi_slopes * relative_position.unsqueeze(0)
-        return alibi_bias # shape: [num_heads, seq_len, seq_len]
-
-    def forward(self, x):
+    def forward(self, x, alibi_bias=None):
         batch_size, seq_len = x.shape[:2]
 
         ## linear projection
@@ -80,9 +78,8 @@ class MHA(nn.Module):
         q_heads = q_heads / math.sqrt(self.head_dim)
         attn_scores = q_heads @ k_heads.transpose(2, 3) # [batch_size, num_heads, seq_len(q_len), seq_len(k_len)]
 
-        ## apply ALiBi bias to attention scores
-        alibi_bias = self._get_alibi_bias(seq_len)  # [num_heads, seq_len, seq_len]
-        attn_scores = attn_scores + alibi_bias.unsqueeze(0)  # broadcast over batch dimension
+        if alibi_bias is not None: # apply ALiBi bias to attention scores
+            attn_scores = attn_scores + alibi_bias.unsqueeze(0)  # broadcast over batch dimension
 
         ## apply mask to attention scores
         mask_bool = self.mask[:seq_len, :seq_len]
@@ -106,7 +103,6 @@ class MHA(nn.Module):
         ## linear projection
         attn_output = self.W_o(attn_output)
         return attn_output
-
 
 class FFN(nn.Module):
     def __init__(self, config):
@@ -132,11 +128,11 @@ class DecoderLayer(nn.Module):
         self.ffn = FFN(config)
         self.dropout_2 = nn.Dropout(config.dropout_ratio)
 
-    def forward(self, x):
+    def forward(self, x, alibi_bias=None):
         ## Pre-LN
         _x = x
         norm_1 = self.layer_norm_1(x)
-        attn_output = self.attn(norm_1)
+        attn_output = self.attn(norm_1, alibi_bias=alibi_bias)
         x = _x + self.dropout_1(attn_output) # residual connection
 
         _x = x
@@ -155,11 +151,20 @@ class GPTModel(nn.Module):
 
         self.lm_heads.weight = self.tok_emb.weight # weight-tying
 
+        ## pre-calculate slopes at model initialization time
+        full_alibi_bias = precompute_alibi_bias(config)
+        self.register_buffer("full_alibi_bias", full_alibi_bias, persistent=False)
+
+
     def forward(self, x):
         x = self.tok_emb(x)
 
+        # ALiBi Bias slicing to fit the current sequence length
+        seq_len = x.size(1)
+        alibi_bias = self.full_alibi_bias[:, :seq_len, :seq_len]
+
         for block in self.decoder_blocks:
-            x = block(x)
+            x = block(x, alibi_bias=alibi_bias)
 
         # unlike Post-LN, Pre-LN performs normalization first, so outputs can be unstable
         # using final_norm guarantees stable logit calculation before mapping the embedding dimension to logits prediction across vocabulary
@@ -199,6 +204,9 @@ def main():
     decoded_text = encoding.decode(generated_ids[0].tolist())
     print(f"input: {context}")
     print(f"output: {decoded_text}")
+
+    ab = precompute_alibi_bias(config)
+    print(ab.shape)
 
 if __name__ == "__main__":
     main()
